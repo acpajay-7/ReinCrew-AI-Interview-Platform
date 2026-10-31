@@ -1,0 +1,22 @@
+# Web Framework & Interface
+streamlit>=1.36.0,<2.0.0
+
+# Audio Processing & Transcription
+faster-whisper>=1.0.0
+av>=11.0.0,<14.0.0
+soundfile>=0.12.1
+numpy>=1.26.0,<2.0.0
+
+# LLM Providers & Core AI SDKs
+openai>=1.30.0
+anthropic>=0.28.0
+mistralai>=0.4.0
+google-genai>=0.1.0
+
+# Data Validation, Parsing & Environment
+pydantic>=2.7.0,<3.0.0
+python-dotenv>=1.0.1
+requests>=2.31.0
+
+# Testing & Development
+pytest>=8.2.0  # Compatibility pin for faster-whisper / PyAV metadata_errors

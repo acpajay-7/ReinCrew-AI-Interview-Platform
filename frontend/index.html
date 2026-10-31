@@ -1,0 +1,243 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  *{box-sizing:border-box} body{margin:0;font-family:Inter,system-ui,Arial,sans-serif;color:#172033;background:transparent}
+  .shell{border:1px solid #e4e8f0;border-radius:18px;padding:16px;background:#fff;box-shadow:0 8px 30px rgba(25,35,60,.06)}
+  .top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+  .state{display:inline-flex;align-items:center;gap:8px;font-size:14px;font-weight:700;color:#475467}
+  .dot{width:10px;height:10px;border-radius:50%;background:#98a2b3}
+  .dot.live{background:#e5484d;box-shadow:0 0 0 5px #fee4e2;animation:pulse 1.2s infinite}
+  .dot.speak{background:#4f46e5;box-shadow:0 0 0 5px #e0e7ff;animation:pulse 1.2s infinite}
+  .dot.busy{background:#f79009;box-shadow:0 0 0 5px #fef0c7}
+  @keyframes pulse{50%{opacity:.55}}
+  .layout{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(220px,.8fr);gap:16px;align-items:start}
+  .question{background:#f7f8fc;border:1px solid #e8ebf3;border-radius:14px;padding:18px;min-height:170px}
+  .eyebrow{font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:#667085;font-weight:800;margin-bottom:10px}
+  .qtext{font-size:20px;line-height:1.5;font-weight:700;color:#172033}
+  .says{font-size:13px;color:#667085;font-style:italic;margin-bottom:8px;min-height:18px}
+  video{width:100%;aspect-ratio:4/3;object-fit:cover;background:#101828;border-radius:14px;display:block;transform:scaleX(-1)}
+  .camera-label{font-size:12px;color:#667085;margin-top:7px}
+  .meter{height:8px;border-radius:99px;background:#edf0f5;overflow:hidden;margin-top:14px}
+  .meter>div{height:100%;width:0;background:#4f46e5;transition:width .12s}
+  .hint{font-size:13px;color:#667085;line-height:1.45;margin-top:10px;min-height:38px}
+  .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  button{border:1px solid #d0d5dd;background:#fff;border-radius:10px;padding:9px 13px;font-weight:700;cursor:pointer;color:#344054}
+  button.primary{background:#4f46e5;border-color:#4f46e5;color:#fff}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  #gate{display:none;margin-top:12px;padding:12px;border-radius:12px;background:#eef2ff;border:1px solid #c7d2fe;font-size:13px}
+  @media(max-width:620px){.layout{grid-template-columns:1fr}.qtext{font-size:18px}.shell{padding:12px}}
+</style>
+<script>
+// Minimal Streamlit component bridge (inline: no CDN needed).
+const Streamlit = {
+  RENDER_EVENT: 'streamlit:render',
+  events: { addEventListener(name, cb) {
+    window.addEventListener('message', (e) => {
+      const d = e.data || {};
+      if (d.isStreamlitMessage && d.type === name) cb(new CustomEvent(name, { detail: d }));
+    });
+  }},
+  setComponentReady() { window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:componentReady',apiVersion:1}, '*'); },
+  setFrameHeight(h) { window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setFrameHeight',height:h}, '*'); },
+  setComponentValue(v) { window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setComponentValue',value:v,dataType:'json'}, '*'); }
+};
+</script>
+</head>
+<body>
+<div class="shell">
+  <div class="top">
+    <div class="state"><span id="dot" class="dot"></span><span id="status">Preparing your interview…</span></div>
+    <div id="timer" style="font-size:12px;color:#667085"></div>
+  </div>
+  <div class="layout">
+    <div>
+      <div class="question">
+        <div class="eyebrow" id="counter">QUESTION</div>
+        <div class="says" id="says"></div>
+        <div class="qtext" id="question">Loading…</div>
+      </div>
+      <div class="meter"><div id="level"></div></div>
+      <div class="hint" id="hint">Allow microphone and camera access when your browser asks.</div>
+      <div id="gate"><b>One tap needed:</b> your browser blocked automatic voice.
+        <button id="gateBtn" class="primary" style="margin-left:8px">▶ Continue interview</button></div>
+      <div class="actions">
+        <button id="finish" class="primary" disabled>I'm done answering</button>
+        <button id="repeat" disabled>Repeat question</button>
+      </div>
+    </div>
+    <div>
+      <video id="preview" autoplay muted playsinline></video>
+      <div class="camera-label">Your camera preview · video is not recorded or uploaded</div>
+    </div>
+  </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const statusEl=$('status'), hintEl=$('hint'), dot=$('dot'), levelEl=$('level');
+const finishBtn=$('finish'), repeatBtn=$('repeat'), gate=$('gate');
+
+const SILENCE_MS=3200;      // pause after speaking that ends the answer
+const NO_SPEECH_NUDGE_S=25; // gentle reminder if nothing heard
+const MAX_ANSWER_S=150;     // hard cap
+
+let mediaStream=null, audioCtx=null, analyser=null, recorder=null, chunks=[], raf=null;
+let currentToken=null, runId=0, stopped=true, paused=false, pendingGate=null;
+let floor=0.05, smooth=0;
+
+function setStatus(t,cls=''){statusEl.textContent=t;dot.className='dot '+cls;}
+function setHint(t){hintEl.textContent=t;}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+
+/* ---------- speech (interviewer voice) ---------- */
+let voice=null;
+function pickVoice(){
+  const vs=speechSynthesis.getVoices();
+  voice=vs.find(v=>/en[-_](IN|GB|US)/i.test(v.lang)&&/natural|google|neural|samantha|female|zira/i.test(v.name))
+      ||vs.find(v=>/^en/i.test(v.lang))||null;
+}
+if('speechSynthesis' in window){pickVoice();speechSynthesis.onvoiceschanged=pickVoice;}
+
+// Resolves 'ok' | 'blocked' | 'unsupported'. Speaks in sentence chunks (avoids Chrome's ~15s cut-off bug).
+async function speak(text,myRun){
+  if(!text)return 'ok';
+  if(!('speechSynthesis' in window))return 'unsupported';
+  const parts=text.match(/[^.!?]+[.!?]*\s*/g)||[text];
+  speechSynthesis.cancel();
+  for(const part of parts){
+    if(myRun!==runId)return 'ok';
+    const res=await new Promise(resolve=>{
+      let done=false; const fin=v=>{if(!done){done=true;clearTimeout(t);resolve(v);}};
+      const u=new SpeechSynthesisUtterance(part.trim()); u.rate=0.97; if(voice)u.voice=voice;
+      u.onend=()=>fin('ok');
+      u.onerror=e=>fin(e&&e.error==='not-allowed'?'blocked':'ok');
+      const t=setTimeout(()=>fin('ok'),Math.min(20000,Math.max(3500,part.length*110)));
+      speechSynthesis.speak(u);
+    });
+    if(res==='blocked')return 'blocked';
+  }
+  return 'ok';
+}
+function waitForGesture(){
+  return new Promise(resolve=>{gate.style.display='block';
+    $('gateBtn').onclick=()=>{gate.style.display='none';resolve();};});
+}
+
+/* ---------- media ---------- */
+async function ensureMedia(){
+  if(mediaStream&&mediaStream.getAudioTracks().some(t=>t.readyState==='live'))return;
+  mediaStream=await navigator.mediaDevices.getUserMedia({
+    audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:true}
+  ).catch(async()=>navigator.mediaDevices.getUserMedia({audio:true})); // camera optional
+  $('preview').srcObject=mediaStream;
+  audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+  const src=audioCtx.createMediaStreamSource(new MediaStream(mediaStream.getAudioTracks()));
+  analyser=audioCtx.createAnalyser(); analyser.fftSize=2048; src.connect(analyser);
+}
+function pickMime(){
+  const c=['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg;codecs=opus'];
+  return c.find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||'';
+}
+function releaseMedia(){
+  if(raf)cancelAnimationFrame(raf);
+  if(mediaStream)mediaStream.getTracks().forEach(t=>t.stop());
+  mediaStream=null; if(audioCtx){audioCtx.close().catch(()=>{});audioCtx=null;}
+}
+
+/* ---------- one question cycle ---------- */
+function recordAnswer(myRun){
+  return new Promise((resolve,reject)=>{
+    try{
+      if(audioCtx&&audioCtx.state==='suspended')audioCtx.resume();
+      const mime=pickMime();
+      recorder=new MediaRecorder(new MediaStream(mediaStream.getAudioTracks()),mime?{mimeType:mime}:undefined);
+      chunks=[];
+      recorder.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data);};
+      recorder.onstop=()=>resolve(new Blob(chunks,{type:recorder.mimeType||mime||'audio/webm'}));
+      recorder.onerror=e=>reject(e.error||new Error('recorder error'));
+      recorder.start(250);
+    }catch(e){reject(e);return;}
+    stopped=false; const t0=Date.now(); let speech=false, silenceSince=null, nudged=false, speechMs=0, last=t0;
+    finishBtn.disabled=false; repeatBtn.disabled=false;
+    setStatus('Your turn — I\'m listening','live'); setHint('Speak naturally. When you finish, just pause — your answer is submitted automatically.');
+    const data=new Uint8Array(analyser.fftSize);
+    const stop=()=>{if(stopped)return;stopped=true;finishBtn.disabled=true;repeatBtn.disabled=true;
+      if(recorder&&recorder.state!=='inactive')recorder.stop();};
+    finishBtn.onclick=stop;
+    const tick=()=>{
+      if(stopped)return;
+      if(myRun!==runId){stop();return;}
+      analyser.getByteTimeDomainData(data); let s=0;
+      for(const v of data){const x=(v-128)/128;s+=x*x;}
+      const rms=Math.sqrt(s/data.length); smooth=smooth*0.8+rms*0.2;
+      floor=Math.min(floor*1.002+0.00002,smooth);
+      const thr=Math.max(0.014,Math.min(0.06,floor*2.5+0.006));
+      levelEl.style.width=Math.min(100,Math.round(rms*500))+'%';
+      const now=Date.now(), el=(now-t0)/1000; $('timer').textContent=Math.floor(el)+'s';
+      if(smooth>thr){speech=true;silenceSince=null;speechMs+=now-last;}
+      else if(speech&&speechMs>1200){ if(!silenceSince)silenceSince=now; if(now-silenceSince>SILENCE_MS){stop();return;} }
+      last=now;
+      if(!speech&&!nudged&&el>NO_SPEECH_NUDGE_S){nudged=true;setHint('I can\'t hear you yet. Please check your microphone and start answering.');}
+      if(el>MAX_ANSWER_S){stop();return;}
+      raf=requestAnimationFrame(tick);
+    };
+    tick();
+  });
+}
+async function toBase64(blob){
+  const bytes=new Uint8Array(await blob.arrayBuffer()); let bin=''; const step=0x8000;
+  for(let i=0;i<bytes.length;i+=step)bin+=String.fromCharCode.apply(null,bytes.subarray(i,i+step));
+  return btoa(bin);
+}
+function sendError(message,token){setStatus('Setup problem');setHint(message);
+  Streamlit.setComponentValue({type:'error',message,token});}
+
+async function begin(args){
+  const token=[args.question_index,args.attempt||0,args.question].join('|');
+  if(token===currentToken)return;
+  currentToken=token; const myRun=++runId;
+  if(recorder&&recorder.state!=='inactive'){try{recorder.stop();}catch(e){}}
+  $('counter').textContent=`QUESTION ${args.question_index} OF ${args.total_questions}`;
+  $('question').textContent=args.question; $('says').textContent='';
+  levelEl.style.width='0%'; finishBtn.disabled=true; repeatBtn.disabled=true; $('timer').textContent='';
+  if(args.paused){setStatus('Paused — please use the typed answer below');setHint('');return;}
+  try{
+    setStatus('Connecting your microphone…','busy'); setHint('Allow camera and microphone if your browser asks.');
+    await ensureMedia();
+    if(myRun!==runId)return;
+    // Interviewer speaks: optional intro / acknowledgement, then the question
+    const lead=args.lead||'';
+    setStatus('Interviewer is speaking…','speak');
+    $('says').textContent=lead?('“'+lead+'”'):''; setHint('Please listen to the question.');
+    let r=await speak([lead,args.question].filter(Boolean).join(' '),myRun);
+    if(r==='blocked'){setStatus('Tap to continue');await waitForGesture();
+      if(myRun!==runId)return; r=await speak([lead,args.question].filter(Boolean).join(' '),myRun);}
+    if(myRun!==runId)return;
+    await sleep(350);
+    repeatBtn.onclick=async()=>{if(stopped)return;setStatus('Repeating question…','speak');
+      const prev=recorder&&recorder.state==='recording';
+      speechSynthesis.cancel(); await speak(args.question,runId); setStatus('Your turn — I\'m listening','live');};
+    const blob=await recordAnswer(myRun);
+    if(myRun!==runId)return;
+    setStatus('Thank you — evaluating your answer…','busy'); setHint('Please wait a moment. The next question will start automatically.');
+    levelEl.style.width='0%';
+    if(!blob.size){sendError('The recording was empty.',token);return;}
+    const b64=await toBase64(blob);
+    Streamlit.setComponentValue({type:'answer',audio_base64:b64,mime_type:blob.type,token});
+  }catch(e){
+    sendError((e&&e.name?e.name+': ':'')+(e&&e.message?e.message:'Could not access your microphone')+
+      '. Allow microphone access and use localhost or HTTPS.',token);
+  }
+}
+window.addEventListener('beforeunload',()=>{runId++;try{speechSynthesis.cancel();}catch(e){}releaseMedia();});
+Streamlit.events.addEventListener(Streamlit.RENDER_EVENT,(ev)=>{
+  const args=ev.detail.args||{}; Streamlit.setFrameHeight(440);
+  if(args.finished){runId++;try{speechSynthesis.cancel();}catch(e){}releaseMedia();setStatus('Interview complete');return;}
+  begin(args);
+});
+Streamlit.setComponentReady();
+</script>
+</body>
+</html>
